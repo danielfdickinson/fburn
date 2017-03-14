@@ -1,0 +1,133 @@
+#!/bin/sh
+
+
+if [ "$2" != "gui" ] ; then
+    DEBUG=$2
+else
+    DEBUG=$3
+fi
+
+if [ -n "$STY" ]; then
+    if [ "$DEBUG" != "debug" ]; then
+	INTERACTIVE=1
+    else
+	INTERACTIVE=0
+    fi
+else     
+    if [ "$2" = "gui" ]; then
+	INTERACTIVE=0
+    else
+	INTERACTIVE=1
+    fi
+fi    
+
+
+TMPFILE=$(mktemp -t "exit_code.XXXXXX")
+
+errbox () {
+    if [ "$DEBUG" != "debug" ]; then
+        if [ "$INTERACTIVE" -eq 1 ]; then
+	    dialog --clear
+            dialog --msgbox "$1" 9 70
+        else
+	    zenity --error --text="$1"
+        fi
+    else
+	echo "$1"
+    fi
+}
+
+infobox () {
+    if [ "$DEBUG" != "debug" ]; then
+        if [ "$INTERACTIVE" -eq 1 ]; then
+            dialog --clear	
+            dialog --msgbox "$1" 9 70
+        else
+	    zenity --info --text="$1"
+        fi
+   else
+       echo "$1"
+   fi
+}
+
+progressbar () {
+    if [ "$DEBUG" != "debug" ]; then
+        if [ "$INTERACTIVE" -eq 1 ]; then
+	    dialog --clear
+            dialog --guage "$1" 9 70 2>&1
+        else
+            zenity --progress --text="$1" --auto-close 2>&1
+       fi
+    else
+	cat
+    fi
+}
+
+copy_image () {
+     
+    if [ "$DEBUG" = "debug" ]; then
+	echo "Copying image"
+    fi
+    ( pv -W -n $1 | dd of=/dev/fd0 ) 2>&1 | tee $TMPFILE | progressbar "Copying image $1 to /dev/fd0"  
+    EXIT=$(cat $TMPFILE | sed -e '/^[0-9][0-9]*$/!d' | tail -n 1 )
+    if [ "$DEBUG" = "debug" ]; then
+	cat $TMPFILE
+	echo $EXIT
+    fi    
+    rm -f $TMPFILE
+}
+
+compare_image () {
+    if [ "$DEBUG" = "debug" ]; then
+        echo "Comparing image"
+    fi
+    SIZE=$(du -s -b $1 | cut -f1)
+    if [ "$DEBUG" = "debug" ]; then
+        echo $SIZE
+    fi
+    ( pv -W -n -s $SIZE $1 | cmp -n $SIZE /dev/fd0 ) 2>&1 | tee $TMPFILE | progressbar "Comparing file $1 to /dev/fd0" 
+    EXIT=$(cat $TMPFILE | sed -e '/^[0-9][0-9]*$/!d' | tail -n 1 )
+    if [ "$DEBUG" = "debug" ]; then
+	cat $TMPFILE
+	echo $EXIT
+    fi
+    rm -f $TMPFILE
+}
+
+copy_compare () {
+    
+    copy_image $1
+    if [ "$EXIT" != "100" ]; then
+	DDOK=0
+    else
+	DDOK=1
+    fi
+    compare_image $1
+    
+}
+
+
+copy_compare $1
+
+if [ "$EXIT" != "100" ] || [ "$DDOK" -eq 0 ]; then
+    if [ "$DEBUG" = "debug" ]; then
+         echo "Formatting floppy"
+    fi
+    superformat -v 2 --superverify /dev/fd0 | cat -A |  ( pv -n -s 642 1>/dev/null ) 2>&1 | tee $TMPFILE | progressbar "Formatting floppy" 
+    FEXIT=$(cat $TMPFILE | sed -e '/^[0-9][0-9]*$/!d' | tail -n 1 )
+    if [ "$FEXIT" = "100" ]; then
+        copy_compare $1
+	    
+        if [ "$EXIT" != "100" ] || [ "$DDOK" -eq 0 ]; then
+	    errbox "Compare failed even after reformat"
+        else
+            infobox "Compare initially failed, but succeeded after reformat"
+        fi
+    else
+       errbox "Format failed"
+    fi
+else
+    infobox "Copy succeeded"
+fi    
+
+rm -f $TMPFILE

@@ -1,0 +1,510 @@
+#!/bin/bash 
+# fburn 1.2.2 is used to write raw data (usually a floppy image) to a
+# floppy.  
+
+# depends on: bash, getopt, dd, cmp, superformat, pv, tee,
+# dialog, and zenity which on debian are provided by bash, util-linux, 
+# coreutils, diff, fdutils, pv, dialog, and zenity
+# zenity is optional (only needed if specifying --gui)
+# TODO: make xdialog vs zenity an option
+# dialog could be optional if default was for zenity or xdialog (and --gui 
+# was the default mode of operation)
+
+# Copyright (C) 2006-2007 Daniel Dickinson <cshore@wightman.ca>
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+display_usage () {
+    echo ""
+    echo "fburn 1.2.2 Copyright (C) 2006-2007 Daniel Dickinson <cshore@wightman.ca>"
+    echo ""
+    echo "fburn is used to write raw data (usually a floppy image) to a floppy."
+    echo "  its default action is the write the image to floppy, then compare"
+    echo "  the floppy to the image.  If there is an error during the compare"
+    echo "  stage, fburn will make at reformatting the floppy and rewriting."
+    echo ""
+    echo "Usage: fburn [options] [image-to-write]"
+    echo ""
+    echo "   -a|--abort-on-failure      Don't try formatting then rewriting the"
+    echo "                              image after a fail in compare or copy"
+    echo ""
+    echo "   -d|--debug                 Display debugging information"
+    echo ""
+    echo "   -f device|--device device  Floppy device name"
+    echo ""
+    echo "   -g|--gui                   Display progress bars, info boxes, and"
+    echo "                              error messages as GUI dialogs"
+    echo "   -h|--help                  This text"
+    echo ""
+    echo "   -i|--initial-format        Format before writing image, instead"
+    echo "                              only after failing to write"
+    echo "   -n|--no-dialogs            Display and prompt on command-line"
+    echo "                             (no popup dialogs)"
+    echo ""
+    echo "image-to-write can be any file small enough to fit on a floppy"
+    echo "  though usually it will be a floppy image.  If no image is"
+    echo "  specified a file browser is opened."
+    echo ""
+}
+
+##################
+# Exit Codes
+#################
+
+OK=0
+CANCEL=1
+
+ERR_IMAGE=2
+ERR_GETOPT=3
+ERR_COPYTMP=4
+ERR_COPYABORT=5
+ERR_CMPTMP=6
+ERR_CMPABORT=7
+ERR_FORMATTMP=8
+ERR_FLOPPYDEVW=9
+ERR_FLOPPYDEVR=10
+ERR_INITFORMAT=11
+ERR_REFORMAT=12
+ERR_INITDD=13
+
+#####################
+#
+# Other constants
+#
+#####################
+
+BLOCKSIZE=512
+
+###############################
+#
+# Default settings for options
+# false, true
+#
+###############################
+
+INITIALFORMAT=false
+DEBUG=false
+GUI=false
+FLOPPYDEV=/dev/fd0
+ABORT=false
+NODIALOG=false
+SKIPLICENSE=false
+
+################################
+#
+# Parse command line options
+#
+################################
+
+CMDLINE=$(getopt --long device:,gui,initial-format,abort-on-failure,debug,no-dialogs,skip-license,help -o f:giadnsh -- "$@")
+
+IMAGE=""
+
+if [ $? != 0 ]; then
+    echo "Error parsing options; Terminating." >&2 ; exit $ERR_GETOPT
+fi
+
+eval set -- "$CMDLINE"
+
+while true; do
+    case "$1" in
+	-f|--device)
+	    FLOPPYDEV=$2
+	    shift 2
+	    ;;
+	-g|--gui)
+	    GUI=true
+	    shift
+	    ;;
+	-i|--initial-format)
+	    INITIALFORMAT=true
+	    shift
+	    ;;
+	-a|--abort-on-failure)
+	    ABORT=true
+	    shift
+	    ;;
+	-d|--debug)
+	    DEBUG=true
+	    shift
+	    ;;
+	-n|--no-dialogs)
+	    NODIALOG=true
+	    shift
+	    ;;
+	-s|--skip-license)
+	    SKIPLICENSE=true
+	    shift
+	    ;;
+	-h|--help)
+	    display_usage
+	    exit 0
+	    ;;
+	--)
+	    shift
+	    break
+	    ;;
+	*)
+	    display_usage
+	    exit 2
+	    ;;
+    esac
+done
+
+for arg do IMAGE="$arg"; break; done
+
+if [ "$DEBUG" == "true" ]; then
+    echo "'$IMAGE'"
+fi
+
+msgbox () {
+    local CANCELLED
+    CANCELLED=false
+
+    if [ "$NODIALOG" == "true" ]; then
+	echo "$1"
+    elif [ "$GUI" == "true" ]; then
+	zenity $2 --text="$1"
+	if [ "$?" == "1" ]; then
+	    CANCELLED=true
+	fi
+    else
+	dialog --clear
+	dialog --msgbox "$1" 12 70
+	if [ "$?" == "1" ]; then
+	    CANCELLED=true
+	fi
+    fi
+    if [ "$CANCELLED" == "true" ]; then
+	exit CANCEL
+    fi
+}
+
+errbox () {
+    msgbox "$1" "--error"
+}
+
+infobox () {
+    msgbox "$1" "--info"
+}
+
+progressbar () {
+
+    if [ "$GUI" == "true" ]; then
+	zenity --progress --text="$1" --auto-close 2>&1
+    elif [ "$NODIALOG" == "false" ]; then
+	dialog --clear
+	dialog --guage "$1" 9 70 2>&1
+    fi
+}
+
+copy_image () {
+    local EXIT
+    local TMPFILE
+    local remainder
+    local fullblocks
+    local fillstr
+    local CANCELLED
+    CANCELLED=false
+    
+     
+    if [ "$DEBUG" == "true" ]; then
+	echo "Copying image"
+    fi
+
+    TMPFILE=$(mktemp -t "exit_code.XXXXXX")
+    if [ "$?" != "0" ]; then
+	errbox "Error getting temporary filename for copy_image"
+	exit $ERR_COPYTMP
+    fi
+
+    if [ "$DEBUG" == "true" ]; then
+	echo "Size: $SIZE"
+    fi
+
+    remainder=$(expr $SIZE % $BLOCKSIZE)
+    fullblocks=$(expr $SIZE / $BLOCKSIZE)
+    if [ $remainder -ne 0 ]; then
+	fullblocks=$(expr $fullblocks + 1)
+    fi	   
+    
+    if [ "$DEBUG" == "true" ]; then
+	echo "remainder: $remainder"
+	echo "fullblocks: $fullblocks"
+    fi
+
+    if [ "$NODIALOG" == "true" ]; then
+	echo "Copying image $1 to $FLOPPYDEV"
+
+	pv -W -p -e -b -s $SIZE "$1" | dd of=$FLOPPYDEV obs=$BLOCKSIZE ibs=1 count=$SIZE conv=fsync oflag=direct ; sync
+	if [ "$?" == "0" ]; then
+	    EXIT="100"
+	else 
+	    EXIT="0"
+        fi
+    else	
+	( pv -W -n "$1" | ( dd of=$FLOPPYDEV obs=$BLOCKSIZE ibs=1 conv=fsync oflag=direct; sync ) ) 2>&1 | tee $TMPFILE | progressbar "Copying image $1 to $FLOPPYDEV"
+	if [ "$?" == "1" ]; then
+	    CANCELLED=true
+	    exit $CANCEL
+	fi
+	EXIT=$(cat $TMPFILE | sed -e '/^[0-9][0-9]*$/!d' | tail -n 1 )
+    fi
+
+    if [ "$DEBUG" == "true" ]; then
+	cat $TMPFILE
+	echo "\$EXIT == $EXIT"
+    fi    
+    rm -f $TMPFILE
+    
+    if [ "$EXIT" != "100" ]; then
+	if [ "$ABORT" == "true" ]; then
+	    errbox "Error writing image to floppy; aborting"
+	    exit $ERR_COPYABORT
+	fi
+	return 1
+    else
+	return 0
+    fi
+}
+
+compare_image () {
+    local EXIT
+    local TMPFILE
+    local CANCELLED
+    CANCELLED=false
+
+    if [ "$DEBUG" == "true" ]; then
+        echo "Comparing image"
+    fi
+
+    TMPFILE=$(mktemp -t "exit_code.XXXXXX")
+    if [ "$?" != "0" ]; then
+	errbox "Error getting temporary filename for compare_image"
+	exit $ERR_CMPTMP
+    fi
+
+    if [ "$NODIALOG" == "true" ]; then
+	echo "Comparing file $1 to $FLOPPYDEV"
+
+	pv -W -e -b -p -s $SIZE "$1" | cmp -n $SIZE $FLOPPYDEV
+	if [ "$?" ==  "0" ]; then
+	    EXIT="100"
+	else
+	    EXIT="0"
+	fi
+    else
+	( pv -W -n "$1" | ( cmp -n $SIZE $FLOPPYDEV ) ) 2>&1 | tee $TMPFILE | progressbar "Comparing file $1 to $FLOPPYDEV" 
+	if [ "$?" == "1" ]; then
+	    CANCELLED=true
+	    exit $CANCEL
+	fi
+	EXIT=$(cat $TMPFILE | sed -e '/^[0-9][0-9]*$/!d' | tail -n 1 )
+    fi
+
+    if [ "$DEBUG" == "true" ]; then
+	cat $TMPFILE
+	echo "\$EXIT == $EXIT"
+    fi
+    rm -f $TMPFILE
+
+    if [ "$EXIT" != "100" ]; then
+	if [ "$ABORT" == "true" ]; then
+	    errbox "Error comparing image to floppy; aborting"
+	    exit $ERR_CMPABORT
+	fi
+	return 1
+    else
+	return 0
+    fi
+}
+
+copy_compare () {
+    local DDOK
+    local CMPOK
+    
+    CMPOK=false
+    
+    copy_image "$1"
+
+    if [ "$?" == "0" ]; then
+	DDOK=true
+    else
+	DDOK=false
+    fi
+
+    if [ "$DDOK" == "true" ]; then
+	compare_image "$1"
+	if [ "$?" == "0" ]; then
+	    CMPOK=true
+	else
+	    CMPOK=false
+	fi
+    else
+	if [ "$DEBUG" == "true" ]; then
+	    echo "Copy failed"
+	fi
+	return 1
+    fi
+
+    if [ "$DDOK" == "true" ] && [ "$CMPOK" == "true" ]; then
+	return 0
+    else
+	if [ "$DEBUG" == "true" ]; then
+	    echo "Compare failed"
+	fi
+	return 1
+    fi    
+}
+
+doformat () {
+    local TMPFILE
+    local EXIT
+
+    TMPFILE=$(mktemp -t "exit_code.XXXXXX")
+
+    if [ "$?" != "0" ]; then
+	errbox "Error getting temporary filename for format"
+	exit $ERR_FORMATTMP
+    fi
+    if [ "$NODIALOG" == "true" ]; then
+	echo "Formatting floppy"
+
+	superformat -v 3 --superverify $FLOPPYDEV 
+	if [ "$?" == "0" ]; then
+	    EXIT="100"
+	else
+	    EXIT="0"
+	fi
+    else
+	superformat -v 2 --superverify $FLOPPYDEV | ( pv -n -s 560 >/dev/null ) 2>&1 | tee $TMPFILE | progressbar "Formatting floppy" 
+    EXIT=$(cat $TMPFILE | sed -e '/^[0-9][0-9]*$/!d' | tail -n 1 )
+    fi
+
+    if [ "$DEBUG" == "true" ]; then
+	cat $TMPFILE
+	echo "\$EXIT == $EXIT"
+    fi
+    rm -f $TMPFILE
+
+    if [ "$EXIT" == "100" ]; then
+	return 0
+    else
+	return 1
+    fi
+}
+
+
+###############################
+
+# SCRIPT BODY
+
+###############################
+
+CANCELLED=false
+
+if [ "$DEBUG" == "true" ]; then
+    echo "Entering main body of fburn script"
+fi
+
+if [ "$NODIALOG" == "false" ] && [ "$GUI" == "false" ]; then
+    dialog --clear
+fi
+
+if [ "$SKIPLICENSE" == "false" ]; then
+    infobox "fburn 1.2.2, Copyright (C) 2006-2007 Daniel Dickinson
+fburn comes with ABSOLUTELY NO WARRANTY; This is free
+software and you are welcome to redistribute it under certain
+conditions; see the GNU Public License which you should have
+received with this software.  If not, see 
+http://www.gnu.org/licenses/gpl.html, or contact the author
+by email at cshore@wightman.ca"
+fi
+
+    if [ ! -r "$IMAGE" ]; then
+	if [ "$GUI" == "true" ]; then
+	    IMAGE="$(zenity --file-selection)"
+	    if [ "$?" == "1" ]; then
+		CANCELLED=true
+	    fi
+	elif [ "$NODIALOG" == "false" ]; then
+	    IMAGE="$(dialog --clear --stdout --fselect "$(pwd)/*" 15 70 )"
+	    if [ "$IMAGE" == "" ]; then
+		CANCELLED=true
+	    fi
+	fi
+    elif [ "$DEBUG" == "true" ]; then
+	echo "Image to write == $IMAGE"
+    fi
+
+if [ "$CANCELLED" == "true" ]; then
+    exit $CANCEL
+fi
+
+if [ -n $(echo "$IMAGE" | tr -d \  ) ]; then
+    if [ ! -r "$IMAGE" ]; then
+	errbox "Specified file '$IMAGE' is not readable"
+	exit $ERR_IMAGE    
+    elif [ "$DEBUG" == "true" ]; then
+	echo "Image to write == $IMAGE"
+    fi
+fi
+
+if [ ! -w "$FLOPPYDEV" ]; then
+    errbox "Specified device for floppy ($FLOPPYDEV) is not writable"
+    exit $ERR_FLOPPYDEVW
+fi
+
+if [ ! -r "$FLOPPYDEV" ]; then
+    errbox "Specified device for floppy ($FLOPPYDEV) is not readable"
+    exit $ERR_FLOPPYDEVR
+fi
+
+if [ "$INITIALFORMAT" == "true" ]; then
+    doformat
+    if [ "$?" != "0" ]; then
+	errbox "Initial format failed"
+	exit $ERR_INITFORMAT
+    fi
+fi    
+
+SIZE=$(du -s -b "$IMAGE" | cut -f1)
+
+if [ "$DEBUG" == "true" ]; then
+    echo "Image size == $SIZE"
+fi
+
+copy_compare "$IMAGE"
+
+if [ "$?" == "0" ]; then
+    infobox "Image successfully written to $FLOPPYDEV"
+    exit 0
+elif [ "$INITIALFORMAT" == "false" ]; then
+    doformat
+    if [ "$?" != "0" ]; then
+	errbox "Format after failed copy or compare also failed"
+	exit $ERR_REFORMAT
+    fi
+else
+    errbox "Writing or comparison of image failed after initial format"
+    exit $ERR_INITDD
+fi
+
+copy_compare "$IMAGE"
+	    
+if [ "$?" != "0" ]; then 
+    errbox "Compare failed even after reformat"
+else
+    infobox "Compare initially failed, but succeeded after reformat"
+fi
